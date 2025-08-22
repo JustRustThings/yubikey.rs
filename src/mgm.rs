@@ -39,10 +39,12 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     consts::{TAG_ADMIN_FLAGS_1, TAG_ADMIN_SALT, TAG_PROTECTED_MGM},
     metadata::{AdminData, ProtectedData},
-    yubikey::YubiKey,
+    piv::{SlotId, ManagementAlgorithmId, ManagementSlotId},
+    transaction::Transaction,
 };
+use crate::yubikey::{Version, YubiKey};
 use des::{
-    cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit},
+    cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, Key, KeyInit, Unsigned},
     TdesEde3,
 };
 #[cfg(feature = "untested")]
@@ -58,16 +60,21 @@ pub(crate) const APPLET_NAME: &str = "YubiKey MGMT";
 #[cfg(feature = "untested")]
 pub(crate) const APPLET_ID: &[u8] = &[0xa0, 0x00, 0x00, 0x05, 0x27, 0x47, 0x11, 0x17];
 
+/// Size of a DES key
+const DES_LEN_DES: usize = 8;
+
+/// Size of a 3DES key
+pub(super) const DES_LEN_3DES: usize = DES_LEN_DES * 3;
+
 pub(crate) const ADMIN_FLAGS_1_PROTECTED_MGM: u8 = 0x02;
 
 #[cfg(feature = "untested")]
 const CB_ADMIN_SALT: usize = 16;
 
-/// Size of a DES key
-const DES_LEN_DES: usize = 8;
-
-/// Size of a 3DES key
-pub(crate) const DES_LEN_3DES: usize = DES_LEN_DES * 3;
+/// The default MGM key loaded for both Triple-DES and AES keys
+const DEFAULT_MGM_KEY: [u8; 24] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,
+];
 
 /// Number of PBKDF2 iterations to use when deriving from a password
 #[cfg(feature = "untested")]
@@ -86,6 +93,58 @@ pub enum MgmType {
     Protected = 2,
 }
 
+#[derive(Clone)]
+enum MgmKeyKind {
+    Tdes([u8; DES_LEN_3DES]),
+}
+
+/// Management key algorithm identifiers
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MgmAlgorithmId {
+    /// Triple DES (3DES) in EDE mode
+    ThreeDes
+}
+
+impl TryFrom<u8> for MgmAlgorithmId {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0x03 => Ok(MgmAlgorithmId::ThreeDes),
+            _ => Err(Error::AlgorithmError),
+        }
+    }
+}
+
+impl From<MgmAlgorithmId> for u8 {
+    fn from(id: MgmAlgorithmId) -> u8 {
+        match id {
+            MgmAlgorithmId::ThreeDes => 0x03,
+        }
+    }
+}
+
+impl MgmAlgorithmId {
+    /// Looks up the algorithm for the given Yubikey's current management key.
+    #[cfg(feature = "untested")]
+    fn query(txn: &Transaction<'_>) -> Result<Self> {
+        match txn.get_metadata(SlotId::Management(crate::piv::ManagementSlotId::Management)) {
+            Ok(metadata) => match metadata.algorithm {
+                ManagementAlgorithmId::ThreeDes => Ok(MgmAlgorithmId::ThreeDes),
+                // We specifically queried the management key slot; getting a known
+                // non-management algorithm back from the Yubikey is invalid.
+                _ => Err(Error::InvalidObject),
+            },
+            // Firmware versions without `GET METADATA` only support 3DES.
+            Err(Error::NotSupported) => Ok(MgmAlgorithmId::ThreeDes),
+            // `Error::AlgorithmError` only occurs when a new algorithm is encountered.
+            Err(Error::AlgorithmError) => Err(Error::NotSupported),
+            // Raise other errors as-is.
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Management Key (MGM).
 ///
 /// This key is used to authenticate to the management applet running on
@@ -93,40 +152,106 @@ pub enum MgmType {
 ///
 /// The only supported algorithm for MGM keys is 3DES.
 #[derive(Clone)]
-pub struct MgmKey([u8; DES_LEN_3DES]);
+pub struct MgmKey(MgmKeyKind);
 
 impl MgmKey {
-    /// Generate a random MGM key
-    pub fn generate() -> Self {
-        let mut key_bytes = [0u8; DES_LEN_3DES];
-        OsRng.fill_bytes(&mut key_bytes);
-        Self(key_bytes)
+     /// Generate a random 3DES MGM key
+     pub fn generate() -> Self {
+         Self::generate_alg(MgmAlgorithmId::ThreeDes, &mut OsRng)
+     }
+
+    /// Generates a random MGM key for the given algorithm.
+    pub fn generate_alg(alg: MgmAlgorithmId, rng: &mut impl RngCore) -> Self {
+        match alg {
+            MgmAlgorithmId::ThreeDes => {
+                let mut key_bytes = [0u8; DES_LEN_3DES];
+                rng.fill_bytes(&mut key_bytes);
+                Self(MgmKeyKind::Tdes(key_bytes))
+            }
+        }
     }
 
-    /// Create an MGM key from byte slice.
-    ///
-    /// Returns an error if the slice is the wrong size or the key is weak.
-    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
-        bytes.as_ref().try_into()
+    /// Generates a random MGM key using the preferred algorithm for the given Yubikey's
+    /// firmware version.
+    pub fn generate_for(yubikey: &YubiKey, rng: &mut impl RngCore) -> Result<Self> {
+        match yubikey.version() {
+            // Initial firmware versions default to 3DES.
+            Version { major: ..=4, .. }
+            | Version {
+                major: 5,
+                minor: ..=6,
+                ..
+            } => Ok(Self::generate_alg(MgmAlgorithmId::ThreeDes, rng)),
+            // Firmware 5.7.0 and above default to AES-192.
+            Version {
+                major: 5,
+                minor: 7..,
+                ..
+            }
+            | Version { major: 6.., .. } => Err(Error::NotSupported),
+        }
     }
 
-    /// Create an MGM key from the given byte array.
+    /// Create a 3DES MGM key from the given byte array.
     ///
     /// Returns an error if the key is weak.
     pub fn new(key_bytes: [u8; DES_LEN_3DES]) -> Result<Self> {
-        if is_weak_key(&key_bytes) {
-            error!(
-                "blacklisting key '{:?}' since it's weak (with odd parity)",
-                &key_bytes
-            );
-
-            return Err(Error::KeyError);
-        }
-
-        Ok(Self(key_bytes))
+       Self::from_bytes(key_bytes, None)
     }
 
-    /// Get derived management key (MGM)
+    /// Parses an MGM key from the given byte slice.
+    ///
+    /// Returns an error if the slice is an invalid size or the key is weak.
+    ///
+    /// If `alg` is `None`, the algorithm will be selected based on the length of the
+    /// slice, returning an error if there is not a unique match.
+    pub fn from_bytes(bytes: impl AsRef<[u8]>, alg: Option<MgmAlgorithmId>) -> Result<Self> {
+        match alg {
+            Some(alg) => Self::parse_key(alg, bytes),
+            None => match bytes.as_ref().len() {
+                DES_LEN_3DES => Self::parse_key(MgmAlgorithmId::ThreeDes, bytes),
+                _ => Err(Error::ParseError),
+            },
+        }
+    }
+
+    /// Gets the default management key for the given Yubikey's firmware version.
+    ///
+    /// Returns an error if the Yubikey's default algorithm is unsupported.
+    pub fn get_default(yubikey: &YubiKey) -> Result<Self> {
+        match yubikey.version() {
+            // Initial firmware versions default to 3DES.
+            Version { major: ..=4, .. }
+            | Version {
+                major: 5,
+                minor: ..=6,
+                ..
+            } => Ok(Self(MgmKeyKind::Tdes(DEFAULT_MGM_KEY.into()))),
+            // Firmware 5.7.0 and above default to AES-192.
+            Version {
+                major: 5,
+                minor: 7..,
+                ..
+            }
+            | Version { major: 6.., .. } => Err(Error::NotSupported),
+        }
+    }
+
+    /// Resets the management key for the given YubiKey to the default value for that
+    /// Yubikey's firmware version.
+    ///
+    /// This will wipe any metadata related to derived and PIN-protected management keys.
+    #[cfg(feature = "untested")]
+    pub fn set_default(yubikey: &mut YubiKey) -> Result<()> {
+        Self::get_default(yubikey)?.set_manual(yubikey, false)
+    }
+
+    /// Derives a 3DES management key (MGM) from a stored salt.
+    ///
+    /// # Security
+    ///
+    /// Warning: PIN-derived mode is not secure. You should not use this technique. It is
+    /// offered only for backwards compatibility.
     #[cfg(feature = "untested")]
     pub fn get_derived(yubikey: &mut YubiKey, pin: &[u8]) -> Result<Self> {
         let txn = yubikey.begin_transaction()?;
@@ -145,15 +270,22 @@ impl MgmKey {
             return Err(Error::GenericError);
         }
 
-        let mut mgm = [0u8; DES_LEN_3DES];
+        let mut mgm = Key::<des::TdesEde3>::default();
         pbkdf2_hmac::<Sha1>(pin, salt, ITER_MGM_PBKDF2, &mut mgm);
-        MgmKey::from_bytes(mgm)
+        is_weak_key(&mgm).then(|| ()).ok_or(Error::KeyError)?;
+        Ok(Self(MgmKeyKind::Tdes(mgm.into())))
     }
 
     /// Get protected management key (MGM)
     #[cfg(feature = "untested")]
     pub fn get_protected(yubikey: &mut YubiKey) -> Result<Self> {
         let txn = yubikey.begin_transaction()?;
+
+        // Check the key algorithm.
+        let alg = MgmAlgorithmId::query(&txn)?;
+        if alg != MgmAlgorithmId::ThreeDes {
+            return Err(Error::NotSupported);
+        }
 
         let protected_data = ProtectedData::read(&txn).map_err(|e| {
             error!("could not read protected data (err: {:?})", e);
@@ -165,25 +297,17 @@ impl MgmKey {
             e
         })?;
 
-        if item.len() != DES_LEN_3DES {
-            error!(
-                "protected data contains MGM, but is the wrong size: {} (expected {})",
-                item.len(),
-                DES_LEN_3DES
-            );
-
-            return Err(Error::AuthenticationError);
-        }
-
-        MgmKey::from_bytes(item)
-    }
-
-    /// Resets the management key for the given YubiKey to the default value.
-    ///
-    /// This will wipe any metadata related to derived and PIN-protected management keys.
-    #[cfg(feature = "untested")]
-    pub fn set_default(yubikey: &mut YubiKey) -> Result<()> {
-        MgmKey::default().set_manual(yubikey, false)
+        Self::parse_key(alg, item).map_err(|e| match e {
+            Error::SizeError => {
+                error!(
+                    "protected data contains MGM, but is the wrong size: {} (expected {:?})",
+                    item.len(),
+                    alg,
+                );
+                Error::AuthenticationError
+            }
+            _ => e,
+        })
     }
 
     /// Configures the given YubiKey to use this management key.
@@ -319,49 +443,97 @@ impl MgmKey {
         Ok(())
     }
 
-    /// Encrypt with 3DES key
-    pub(crate) fn encrypt(&self, input: &[u8; DES_LEN_DES]) -> [u8; DES_LEN_DES] {
-        let mut output = input.to_owned();
-        TdesEde3::new(GenericArray::from_slice(&self.0))
-            .encrypt_block(GenericArray::from_mut_slice(&mut output));
-        output
+    /// Returns the ID used to identify the key algorithm with APDU packets.
+    pub(crate) fn algorithm_id(&self) -> MgmAlgorithmId {
+        match &self.0 {
+            MgmKeyKind::Tdes(_) => MgmAlgorithmId::ThreeDes,
+        }
     }
 
-    /// Decrypt with 3DES key
-    pub(crate) fn decrypt(&self, input: &[u8; DES_LEN_DES]) -> [u8; DES_LEN_DES] {
-        let mut output = input.to_owned();
-        TdesEde3::new(GenericArray::from_slice(&self.0))
-            .decrypt_block(GenericArray::from_mut_slice(&mut output));
-        output
+    /// Returns the key size in bytes.
+    pub(crate) fn key_size(&self) -> u8 {
+        match &self.0 {
+            MgmKeyKind::Tdes(_) => <des::TdesEde3 as des::cipher::KeySizeUser>::KeySize::U8,
+        }
     }
-}
 
-impl AsRef<[u8; DES_LEN_3DES]> for MgmKey {
-    fn as_ref(&self) -> &[u8; DES_LEN_3DES] {
-        &self.0
+    /// Parses an MGM key from the given byte slice.
+    ///
+    /// Returns an error if the algorithm is unsupported, or the slice is the wrong size,
+    /// or the key is weak.
+    fn parse_key(alg: MgmAlgorithmId, bytes: impl AsRef<[u8]>) -> Result<Self> {
+        match alg {
+            MgmAlgorithmId::ThreeDes => {
+                let key_size = <des::TdesEde3 as des::cipher::KeySizeUser>::KeySize::USIZE;
+                if key_size != bytes.as_ref().len() {
+                    return Err(Error::SizeError)
+                }
+                let key = Key::<des::TdesEde3>::from_slice(bytes.as_ref());
+                is_weak_key(&key).then(|| ()).ok_or(Error::KeyError)?;
+                Ok(MgmKeyKind::Tdes((*key).into()))
+            }
+        }
+        .map(Self)
+    }
+
+    /// Encrypts a block with this key.
+    ///
+    /// Returns an error if the block is the wrong size.
+    fn encrypt_block(&self, block: &mut [u8]) -> Result<()> {
+        match &self.0 {
+            MgmKeyKind::Tdes(k) => {
+                des::TdesEde3::new(k.into()).encrypt_block(block.try_into().map_err(|_| Error::SizeError)?)
+            }
+        }
+        Ok(())
+    }
+
+    /// Decrypts a block with this key.
+    ///
+    /// Returns an error if the block is the wrong size.
+    fn decrypt_block(&self, block: &mut [u8]) -> Result<()> {
+        match &self.0 {
+            MgmKeyKind::Tdes(k) => {
+                des::TdesEde3::new(k.into()).decrypt_block(block.try_into().map_err(|_| Error::SizeError)?)
+            }
+        }
+        Ok(())
+    }
+
+    /// Given a challenge from a card, decrypts it and return the value
+    pub(crate) fn card_challenge(&self, challenge: &[u8]) -> Result<Vec<u8>> {
+        let mut output = challenge.to_owned();
+        self.decrypt_block(output.as_mut_slice())?;
+        Ok(output)
+    }
+
+    /// Checks the authentication matches the challenge and auth data
+    pub(crate) fn check_challenge(&self, challenge: &[u8], auth_data: &[u8]) -> Result<()> {
+        let mut response = challenge.to_owned();
+
+        self.encrypt_block(response.as_mut_slice())?;
+
+        use subtle::ConstantTimeEq;
+        if response.ct_eq(auth_data).unwrap_u8() != 1 {
+            return Err(Error::AuthenticationError);
+        }
+
+        Ok(())
     }
 }
 
 /// Default MGM key configured on all YubiKeys
 impl Default for MgmKey {
     fn default() -> Self {
-        MgmKey([
-            1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8,
-        ])
+        MgmKey(MgmKeyKind::Tdes(DEFAULT_MGM_KEY))
     }
 }
 
-impl Drop for MgmKey {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-impl<'a> TryFrom<&'a [u8]> for MgmKey {
-    type Error = Error;
-
-    fn try_from(key_bytes: &'a [u8]) -> Result<Self> {
-        Self::new(key_bytes.try_into().map_err(|_| Error::SizeError)?)
+impl AsRef<[u8]> for MgmKey {
+    fn as_ref(&self) -> &[u8] {
+        match &self.0 {
+            MgmKeyKind::Tdes(k) => k.as_ref(),
+        }
     }
 }
 
@@ -396,7 +568,7 @@ const WEAK_DES_KEYS: &[[u8; DES_LEN_DES]] = &[
 ///
 /// This check is performed automatically when the key is instantiated to
 /// ensure no such keys are used.
-fn is_weak_key(key: &[u8; DES_LEN_3DES]) -> bool {
+fn is_weak_key(key: &Key::<des::TdesEde3>) -> bool {
     // set odd parity of key
     let mut tmp = Zeroizing::new([0u8; DES_LEN_3DES]);
 
