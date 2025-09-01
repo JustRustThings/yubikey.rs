@@ -23,6 +23,7 @@ members = [".", "cli"]
 x509-cert = { version = "0.2.3", features = [ "builder", "hazmat" ] }
 
 [dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
 der = "0.7.1"
 des = "0.8"
 elliptic-curve = "0.13"
