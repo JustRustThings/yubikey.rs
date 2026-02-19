@@ -62,7 +62,10 @@ use std::{
     fmt::{Display, Formatter},
     str::FromStr,
 };
-use x509_cert::{der::Decode, spki::SubjectPublicKeyInfoOwned};
+use x509_cert::{
+    der::{asn1::BitString, Decode},
+    spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfoOwned},
+};
 
 #[cfg(feature = "untested")]
 use {
@@ -86,6 +89,9 @@ const CB_ECC_POINTP384: usize = 97;
 const TAG_RSA_MODULUS: u8 = 0x81;
 const TAG_RSA_EXP: u8 = 0x82;
 const TAG_ECC_POINT: u8 = 0x86;
+
+/// OID for ed25519 and x25519 algorithms
+pub const OID_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
 
 #[cfg(feature = "untested")]
 const KEYDATA_LEN: usize = 1024;
@@ -487,6 +493,12 @@ pub enum AlgorithmId {
 
     /// ECDSA with the NIST P384 curve.
     EccP384,
+
+    /// ED25519
+    Ed25519,
+
+    /// X25519
+    X25519,
 }
 
 impl TryFrom<u8> for AlgorithmId {
@@ -498,6 +510,8 @@ impl TryFrom<u8> for AlgorithmId {
             0x07 => Ok(AlgorithmId::Rsa2048),
             0x11 => Ok(AlgorithmId::EccP256),
             0x14 => Ok(AlgorithmId::EccP384),
+            0xE0 => Ok(AlgorithmId::Ed25519),
+            0xE1 => Ok(AlgorithmId::X25519),
             _ => Err(Error::AlgorithmError),
         }
     }
@@ -510,6 +524,8 @@ impl From<AlgorithmId> for u8 {
             AlgorithmId::Rsa2048 => 0x07,
             AlgorithmId::EccP256 => 0x11,
             AlgorithmId::EccP384 => 0x14,
+            AlgorithmId::Ed25519 => 0xE0,
+            AlgorithmId::X25519 => 0xE1,
         }
     }
 }
@@ -527,6 +543,8 @@ impl AlgorithmId {
             AlgorithmId::Rsa2048 => 128,
             AlgorithmId::EccP256 => 32,
             AlgorithmId::EccP384 => 48,
+            AlgorithmId::Ed25519 => 32,
+            AlgorithmId::X25519 => 32,
         }
     }
 
@@ -535,6 +553,8 @@ impl AlgorithmId {
         match self {
             AlgorithmId::Rsa1024 | AlgorithmId::Rsa2048 => 0x01,
             AlgorithmId::EccP256 | AlgorithmId::EccP384 => 0x6,
+            AlgorithmId::Ed25519 => 0x07,
+            AlgorithmId::X25519 => 0x08,
         }
     }
 }
@@ -870,6 +890,34 @@ pub fn import_ecc_key(
     Ok(())
 }
 
+/// Imports a private ECDH/EdDSA encryption or signing key into the YubiKey.
+///
+/// Errors if `algorithm` isn't `AlgorithmId::Ed25519` or ` AlgorithmId::X25519`.
+#[cfg(feature = "untested")]
+pub fn import_cv_key(
+    yubikey: &mut YubiKey,
+    slot: SlotId,
+    algorithm: AlgorithmId,
+    key_data: &[u8],
+    touch_policy: TouchPolicy,
+    pin_policy: PinPolicy,
+) -> Result<()> {
+    match algorithm {
+        AlgorithmId::Ed25519 | AlgorithmId::X25519 => (),
+        _ => return Err(Error::AlgorithmError),
+    }
+
+    if key_data.len() > KEYDATA_LEN {
+        return Err(Error::SizeError);
+    }
+
+    let params = vec![key_data];
+
+    write_key(yubikey, slot, params, pin_policy, touch_policy, algorithm)?;
+
+    Ok(())
+}
+
 /// Generate an attestation certificate for a stored key.
 ///
 /// <https://developers.yubico.com/PIV/Introduction/PIV_attestation.html>
@@ -1111,6 +1159,36 @@ fn read_public_key(
     //
     //    0x7f 0x49 -> Application | Constructed | 0x49
     match algorithm {
+        AlgorithmId::X25519 | AlgorithmId::Ed25519 => {
+            // 2-byte ASN.1 tag, 1-byte length (because all supported EC pubkey lengths
+            // are shorter than 128 bytes, fitting into a definite short ASN.1 length).
+            let data = if skip_asn1_tag { &input[3..] } else { input };
+
+            let (_, tlv) = Tlv::parse(data)?;
+            let pk_data: [u8; 32] = tlv.value.try_into().map_err(|_| Error::InvalidObject)?;
+
+            match algorithm {
+                AlgorithmId::Ed25519 => SubjectPublicKeyInfoOwned::from_der(
+                    ed25519_dalek::VerifyingKey::from_bytes(&pk_data)
+                        .map_err(|_| Error::InvalidObject)?
+                        .to_public_key_der()
+                        .map_err(|_| Error::InvalidObject)?
+                        .as_bytes(),
+                )
+                .map_err(|_| Error::InvalidObject),
+                AlgorithmId::X25519 => Ok(SubjectPublicKeyInfoOwned {
+                    algorithm: AlgorithmIdentifier {
+                        oid: OID_X25519,
+                        parameters: None,
+                    },
+                    subject_public_key: BitString::from_bytes(
+                        x25519_dalek::PublicKey::from(pk_data).as_bytes(),
+                    )
+                    .map_err(|_| Error::InvalidObject)?,
+                }),
+                _ => Err(Error::AlgorithmError),
+            }
+        }
         AlgorithmId::Rsa1024 | AlgorithmId::Rsa2048 => {
             // It appears that the inner application-specific value returned by the
             // YubiKey is constructed such that RSA pubkeys can be parsed in two ways:
