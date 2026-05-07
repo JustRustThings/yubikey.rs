@@ -12,6 +12,13 @@ pub const ALGORITHM_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.10
 #[derive(Debug)]
 pub struct SignatureWrapper(ed25519_dalek::Signature);
 
+impl std::ops::Deref for SignatureWrapper {
+    type Target = ed25519_dalek::Signature;
+    fn deref(&self) -> &ed25519_dalek::Signature {
+        &self.0
+    }
+}
+
 impl SignatureBitStringEncoding for SignatureWrapper {
     fn to_bitstring(&self) -> der::Result<BitString> {
         BitString::from_bytes(self.0.to_bytes().as_ref())
