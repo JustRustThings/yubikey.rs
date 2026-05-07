@@ -251,7 +251,7 @@ pub mod yubikey_signer {
         oid::db::rfc5912,
         Encode, Sequence,
     };
-    use sha2::{Digest, Sha256, Sha384, Sha512};
+    use sha2::{Digest, Sha256, Sha384};
     use signature::Keypair;
     use std::{cell::RefCell, fmt, io::Write, marker::PhantomData};
     use x509_cert::spki::{
@@ -298,7 +298,7 @@ pub mod yubikey_signer {
         type PublicKey = crate::ed25519_wrapper::VerifyingKeyWrapper;
 
         fn prepare(input: &[u8]) -> SigResult<Vec<u8>> {
-            Ok(Sha512::digest(input).to_vec())
+            Ok(input.to_vec())
         }
 
         fn prepare_prehash(hashed: &[u8]) -> SigResult<Vec<u8>> {
